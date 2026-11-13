@@ -2,8 +2,10 @@
 
 import { useEffect, useState } from "react";
 
+const API_URL = 'http://localhost:8000/api/top/'
+
 interface Memo{
-    createdAt: string,
+    updatedAt: string,
     id: string,
     title: string,
     content: string,
@@ -21,63 +23,93 @@ export default function TopPage(){
         content: '',
     })
 
+    const [errorMessage, setErrorMessage] = useState<string|null>(null)
+
     const [memoHistory, setMemoHistory] = useState<Memo[]>([])
 
     const [editingId, setEditingId] = useState<string|null>(null)
 
-    const showMemoHistory = async() => {
-        const res = await fetch('http://localhost:8000/api/top', {
-            cache: 'no-store'
-        });
-        if(!res.ok) throw new Error('メモ履歴取得できませんでした');
-        const json: { data: Memo[]} = await res.json();
+    const [countMemo, setCountMemo] = useState<number|null>(null)
 
-        const sortedData = json.data.sort((a, b) => {
-            return new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime()
-        });
-        setMemoHistory(sortedData)
+    const showMemoHistory = async() => {
+
+        try{setErrorMessage(null)
+            setCountMemo(null)
+            const res = await fetch(API_URL, {
+                cache: 'no-store'
+            });
+            if(!res.ok) throw new Error('メモ履歴取得できませんでした');
+            const json: { data?: Memo[]} = await res.json();
+            const sortedData = (json.data || []).sort((a, b) => {
+                return new Date(b.updatedAt).getTime() - new Date(a.updatedAt).getTime()
+            });
+            setCountMemo(sortedData.length)
+            setMemoHistory(sortedData)
+        }catch(e){
+            console.error(e)
+            setErrorMessage('メモ履歴の取得が失敗しました')
+        }
     }
 
     const handleSave = async () => {
+        setErrorMessage(null)
         if(!memoData.title.trim() && !memoData.content.trim()){
-            alert("未入力のため、保存できません")
+            setErrorMessage('未入力のため、保存できません')
             return;
         }
-        const response = await fetch('http://localhost:8000/api/top', {
-            method: 'POST',
-            headers: {
-                'Content-Type': 'application/json',
-            },
+        try{const response = await fetch(API_URL, {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                },
             body: JSON.stringify(memoData),
-        });
+            });
+            if(!response.ok) throw new Error('メモの保存が失敗しました')
 
-        await showMemoHistory()
+            await showMemoHistory()
 
-        if(response.ok) setMemoData({title: "", content: ""});
+            setMemoData({title: "", content: ""});
+        }catch(e){
+            console.error(e);
+            setErrorMessage('メモの保存が失敗しました')
+        }
     }
 
     const handleDelete = async (id: string) => {
-        const response = await fetch (`http://localhost:8000/api/top/${id}`, {
-            method: 'DELETE',
-        });
-        await showMemoHistory()
+        try{setErrorMessage(null)
+            if(!window.confirm("メモ削除でよろしいですか？")) return;
+            const response = await fetch (`${API_URL}${id}`, {
+                method: 'DELETE',
+            });
+            if(!response.ok) throw new Error('メモ削除できませんでした')
+            await showMemoHistory()
+        }catch(e){
+            console.error(e);
+            setErrorMessage('メモ削除できませんでした');
+        }
     }
 
     const handleUpdate = async (id: string) => {
+        setErrorMessage(null)
         if(!editingMemoData.title.trim() && !editingMemoData.content.trim()){
-            alert("未入力のため、保存できません")
+            setErrorMessage('未入力のため、保存できません')
             return;
         }
-
-        const response = await fetch(`http://localhost:8000/api/top/${id}`, {
-            method: 'PUT',
-            headers: {
-                'Content-Type': 'application/json',
-            },
-            body: JSON.stringify(editingMemoData),
-        });
-        if(response.ok) setEditingId(null)
-        await showMemoHistory()
+        try{
+            const response = await fetch(`${API_URL}${id}`, {
+                method: 'PUT',
+                headers: {
+                    'Content-Type': 'application/json',
+                },
+                body: JSON.stringify(editingMemoData),
+            });
+            setEditingId(null)
+            if(!response.ok) throw new Error('編集した内容の保存ができませんでした')
+            await showMemoHistory()
+        }catch(e){
+            console.error(e);
+            setErrorMessage('編集した内容の保存ができませんでした')
+        }
     }
 
     useEffect(() => {
@@ -87,6 +119,7 @@ export default function TopPage(){
 
     return (
         <div className="w-full max-w-2xl mx-auto mt-12 p-6 bg-white dark:bg-gray-900 rounded-xl shadow-md border border-gray-200 dark:border-gray-800 space-y-4">
+            {errorMessage===null ? (null):(<p className="mb-4 text-sm text-red-500">{errorMessage}</p>)}
             <div>
                 <input
                 type="text"
@@ -119,6 +152,7 @@ export default function TopPage(){
             <div className="mt-8 border-t border-gray-200 dark:border-gray-800 pt-6">
                 <h3 className="text-lg font-bold mb-4 text-gray-900 dark:text-gray-100">メモ履歴</h3>
                 <div className="space-y-3">
+                    {countMemo===0 ? (<p>まだ何も書かれていません</p>):(null)}
                     {memoHistory.map((memo) => (
                         <div key={memo.id} className="p-4 border border-gray-200 dark:border-gray-800 rounded-lg space-y-1 relative">
                             {editingId === memo.id ? (
@@ -149,7 +183,7 @@ export default function TopPage(){
                                 <>
                                     <h4 className="font-bold text-gray-800 dark:text-gray-200">{memo.title || "（NO TITLE)"}</h4>
                                     <p className="text-sm text-gray-600 dark:text-gray-400 whitespace-pre-wrap">{memo.content || " (NO CONTENT) "}</p>
-                                    <span className="text-xs text-gray-400">{memo.createdAt}</span>
+                                    <span className="text-xs text-gray-400">{memo.updatedAt}</span>
                                     <button
                                     onClick={() => handleDelete(memo.id)}
                                     className="px-1 py-0.5 bg-red-600 hover:bg-red-700 text-white font-medium rounded-lg shadow-sm transition-colors focus:outline-none focus:ring-2 focus:ring-red-500 focus:ring-offset-2 absolute bottom-4 right-4 text-xs"

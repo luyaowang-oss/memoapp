@@ -1,10 +1,10 @@
-from fastapi import APIRouter
+from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 import boto3
 import uuid
 from datetime import datetime
 from zoneinfo import ZoneInfo
-from botocore.exceptions import ClientError
+from botocore.exceptions import ClientError, EndpointConnectionError
 
 router = APIRouter(prefix="/api/top", tags=["top"])
 
@@ -24,6 +24,8 @@ def get_table():
     tbl = dynamodb.Table(table_name)
     try:
         tbl.load()
+    except EndpointConnectionError:
+        raise HTTPException(status_code=503, detail="データベースに繋ぎません")
     except ClientError as e:
         if e.response.get("Error", {}).get("Code") == "ResourceNotFoundException":
             tbl = dynamodb.create_table(
@@ -39,60 +41,73 @@ def get_table():
 
 @router.post("/")
 async def save_page_data(data: PageDataCreate):
-    item_id = str(uuid.uuid4())
-    japan_time = datetime.now(ZoneInfo("Asia/Tokyo")).strftime("%Y-%m-%d %H:%M:%S")
-    item = {
-        'id': item_id,
-        'title': data.title,
-        'content': data.content,
-        'createdAt': japan_time,
-    }
+    try:
+        item_id = str(uuid.uuid4())
+        japan_time = datetime.now(ZoneInfo("Asia/Tokyo")).strftime("%Y-%m-%d %H:%M:%S")
+        item = {
+            'id': item_id,
+            'title': data.title,
+            'content': data.content,
+            'updatedAt': japan_time,
+        }
 
-    tbl = get_table()
-    tbl.put_item(Item=item)
+        tbl = get_table()
+        tbl.put_item(Item=item)
 
-    return {
-        "message": "success",
-        "data": item
-    }
+        return {
+            "message": "success",
+            "data": item
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"メモ保存失敗: {str(e)}")
 
 @router.get("/")
 async def get_page_data():
-    tbl = get_table()
-    response = tbl.scan()
-    items = response.get('Items', [])
-    return {
-        "message": "success",
-        "count": len(items),
-        "data": items
-    }
+    try:
+        tbl = get_table()
+        response = tbl.scan()
+        items = response.get('Items', [])
+        return {
+            "message": "success",
+            "count": len(items),
+            "data": items
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"メモ取得失敗: {str(e)}")
 
 @router.delete("/{id}")
 async def delete_memo(id: str):
-    tbl = get_table()
-    response = tbl.delete_item(
-        Key={
-            'id': id,
-        }
-    )
-    return {"status": "success", "delete": response.get("Attributes")}
+    try:
+        tbl = get_table()
+        response = tbl.delete_item(
+            Key={
+                'id': id,
+            }
+        )
+        return {"status": "success", "delete": response.get("Attributes")}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"メモ削除失敗: {str(e)}")
 
 @router.put("/{id}")
-async def uodate_memo(id:str, newMemo: PageDataCreate):
-    tbl = get_table()
-    response = tbl.update_item(
-        Key={
-            'id': id
-        },
-        UpdateExpression='SET title = :t, content= :c',
-        ExpressionAttributeValues={
-            ':t' : newMemo.title,
-            ':c' : newMemo.content,
-        },
-        ReturnValues="ALL_NEW"
-    )
-
-    return{
-        "message": "success",
-        "data": response.get("Attributes")
-    }
+async def update_memo(id:str, newMemo: PageDataCreate):
+    try:
+        tbl = get_table()
+        japan_time = datetime.now(ZoneInfo("Asia/Tokyo")).strftime("%Y-%m-%d %H:%M:%S")
+        response = tbl.update_item(
+            Key={
+                'id': id
+            },
+            UpdateExpression='SET title = :t, content= :c, updatedAt= :u',
+            ExpressionAttributeValues={
+                ':t' : newMemo.title,
+                ':c' : newMemo.content,
+                ':u' : japan_time,
+            },
+            ReturnValues="ALL_NEW"
+        )
+        return{
+            "message": "success",
+            "data": response.get("Attributes")
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"メモ更新失敗: {str(e)}")
