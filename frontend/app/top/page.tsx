@@ -1,9 +1,10 @@
 "use client";
 
-import { useEffect, useState, useRef, memo } from "react";
+import { useEffect, useState, useRef } from "react";
 
 // APIのエンドポイント
 const API_URL = 'http://localhost:8000/api/top/'
+const UPLOAD_URL = 'http://localhost:8000/api/top/upload'
 
 // メモデータの型定義
 interface Memo{
@@ -11,6 +12,12 @@ interface Memo{
     id: string,
     title: string,
     content: string,
+}
+
+// 保存前の一時ファイル情報（Fileオブジェクトとプレビュー用Blob URL）
+interface PendingFile {
+    file: File;
+    blobUrl: string;
 }
 
 export default function TopPage(){
@@ -38,6 +45,9 @@ export default function TopPage(){
     // 検索キーワード
     const [keyword, setKeyword] = useState("")
 
+    // 保存処理中フラグ（二重送信防止用）
+    const [isSaving, setIsSaving] = useState(false);
+
     // メモ一覧の取得（更新日時の新しい順にソート）
     const fetchMemos = async() => {
         try{
@@ -58,24 +68,32 @@ export default function TopPage(){
 
     // 検索キーワードによるメモの絞り込み（タイトルまたは本文に含まれるか判定）
     const filtedMemos = allMemos.filter((item) => {
-        const keywordToLow = keyword.toLowerCase()
-        if(!keywordToLow || !keywordToLow.trim()) {
+        const keywordToLow = keyword.toLowerCase().trim()
+        if(!keywordToLow) {
             return true;
         }
-        return (item.title.toLowerCase().includes(keywordToLow) || 
-            item.content.toLowerCase().includes(keywordToLow));
+        const title = (item.title || "").toLowerCase();
+        const content = (item.content || "").toLowerCase();
+        return (title.includes(keywordToLow) || content.includes(keywordToLow));
     })
 
-    // 新規メモの保存処理
+    // 新規メモの保存処理（保存時に未保存ファイルをアップロード）
     const handleSave = async () => {
-        // エディタ内のHTMLコンテンツを取得
-        const currentContent = editorRef.current?.innerHTML || "";
+        const editor = editorRef.current;
+        if(!editor || isSaving) return;
+
         setErrorMessage(null)
-        if(!memoData.title.trim() && !currentContent.trim()){
+        if(!memoData.title.trim() && !editor.innerHTML.trim()){
             setErrorMessage('未入力のため、保存できません')
             return;
         }
+
+        setIsSaving(true);
         try{
+            // エディタ内に残っているファイルをアップロードし、URLを置換
+            await uploadPendingFilesInEditor(editor);
+
+            const currentContent = editor.innerHTML;
             const response = await fetch(API_URL, {
                 method: 'POST',
                 headers: {
@@ -87,15 +105,15 @@ export default function TopPage(){
                 }),
             });
             if(!response.ok) throw new Error('メモの保存が失敗しました')
+
             await fetchMemos()
             setMemoData({title: "", content: ""});
-            // 保存成功後にエディタの入力をクリア
-            if(editorRef.current){
-                editorRef.current.innerHTML = "";
-            }
+            editor.innerHTML = "";
         }catch(e){
             console.error(e);
-            setErrorMessage('メモの保存が失敗しました')
+            setErrorMessage(e instanceof Error ? e.message : 'メモの保存が失敗しました')
+        }finally{
+            setIsSaving(false);
         }
     }
 
@@ -117,14 +135,21 @@ export default function TopPage(){
 
     // メモの更新（編集内容の保存）
     const handleUpdate = async (id: string) => {
-        // 編集用エディタ内のHTMLコンテンツを取得
-        const currentContent = editorHistoryRef.current?.innerHTML || ""
+        const editor = editorHistoryRef.current;
+        if(!editor || isSaving) return;
+
         setErrorMessage(null)
-        if(!editingMemoData.title.trim() && !currentContent.trim()){
+        if(!editingMemoData.title.trim() && !editor.innerHTML.trim()){
             setErrorMessage('未入力のため、保存できません')
             return;
         }
+
+        setIsSaving(true);
         try{
+            // エディタ内に残っているファイルをアップロードし、URLを置換
+            await uploadPendingFilesInEditor(editor);
+
+            const currentContent = editor.innerHTML;
             const response = await fetch(`${API_URL}${id}`, {
                 method: 'PUT',
                 headers: {
@@ -140,7 +165,9 @@ export default function TopPage(){
             setEditingId(null)
         }catch(e){
             console.error(e);
-            setErrorMessage('編集した内容の保存ができませんでした')
+            setErrorMessage(e instanceof Error ? e.message : '編集した内容の保存ができませんでした')
+        }finally{
+            setIsSaving(false);
         }
     }
 
@@ -149,54 +176,112 @@ export default function TopPage(){
     const editorHistoryRef = useRef<HTMLDivElement>(null);
     const fileInputRef = useRef<HTMLInputElement>(null);
     const fileHistoryInputRef = useRef<HTMLInputElement>(null);
+    // エディタ内に未保存の一時ファイルを保持するマップ（tempId -> PendingFile）
+    const pendingFilesRef = useRef<Map<string, PendingFile>>(new Map());
 
-    // エディタへファイル（画像または添付リンク）を挿入する処理
-    const insertFileToEditer = (
+    // エディタ内の未保存ファイルを一括アップロードし、Blob URLを正式なURLに差し替える処理
+    const uploadPendingFilesInEditor = async (editor: HTMLDivElement) => {
+        // data-temp-id 属性を持つ要素（＝現在エディタ内に残っている未保存ファイル）を取得
+        const tempElements = Array.from(
+            editor.querySelectorAll<HTMLElement>("[data-temp-id]")
+        );
+
+        for(const el of tempElements){
+            const tempId = el.dataset.tempId;
+            if(!tempId) continue;
+
+            const pending = pendingFilesRef.current.get(tempId);
+            if(!pending){
+                el.removeAttribute("data-temp-id");
+                continue;
+            }
+
+            // バックエンドへファイルをアップロード
+            const formData = new FormData();
+            formData.append("file", pending.file);
+
+            const res = await fetch(UPLOAD_URL, {
+                method: "POST",
+                body: formData,
+            });
+
+            if(!res.ok) {
+                throw new Error(`${pending.file.name}のアップロードに失敗しました`);
+            }
+
+            const data: { url: string; filename: string } = await res.json();
+
+            // DOMのリンク先を正式なサーバーURLへ更新
+            if(el.tagName === "IMG"){
+                (el as HTMLImageElement).src = data.url;
+            } else if (el.tagName === "A"){
+                const anchor = el as HTMLAnchorElement;
+                anchor.href = data.url;
+                anchor.download = data.filename || pending.file.name;
+                anchor.textContent = `📎 ${data.filename || pending.file.name}`;
+            }
+            // 一時属性の削除とBlob URLの解放
+            el.removeAttribute("data-temp-id");
+            URL.revokeObjectURL(pending.blobUrl);
+            pendingFilesRef.current.delete(tempId);
+        }
+    }
+
+    // エディタへファイル（画像または添付リンク）を挿入する処理（保存前はBlob URLでローカルプレビュー）
+    const insertFileToEditer = async (
         file: File,
         targetRef: React.RefObject<HTMLDivElement | null>,
         asImage: boolean,
     ) => {
-        const reader = new FileReader();
-        reader.onload = (loadEvent) => {
-            const result = loadEvent.target?.result;
-            const editor = targetRef.current;
-            if(typeof result != "string" || !editor) return;
+        const editor = targetRef.current;
+        if(!editor) return;
 
-            let nodeToInsert: HTMLElement;
+        // 一時IDとローカルプレビュー用Blob URLを生成
+        const tempId = `${Date.now()}-${Math.random().toString(36).slice(2,9)}`;
+        const blobUrl = URL.createObjectURL(file);
 
-            if(file.type.startsWith("image/") && asImage){
-                // 貼り付け画像の場合はimg要素として生成
-                const img = document.createElement("img");
-                img.src = result;
-                img.className = "inline-block max-h-48 my-2 mr-2 rounded-lg border border-gray-200 dark:border-gray-700 align-top";
-                nodeToInsert = img;
-            } else {
-                // その他のファイルはダウンロード用リンクとして生成
-                const link = document.createElement("a")
-                link.href = result;
-                link.download = file.name;
-                link.contentEditable = "false";
-                link.textContent = `📎 ${file.name}`;
-                link.className = "inline-flex items-center gap-1 px-2.5 py-1 my-1 mr-2 text-xs font-medium text-blue-700 dark:text-blue-300 bg-blue-50 dark:bg-blue-900/30 border border-blue-200 dark:border-blue-800 rounded-md hover:bg-blue-100 cursor-pointer";
-                nodeToInsert = link;
+        // 未保存ファイルとして一時保持
+        pendingFilesRef.current.set(tempId, { file, blobUrl });
+
+        let nodeToInsert: HTMLElement;
+
+        if(file.type.startsWith("image/") && asImage){
+            // 貼り付け画像の場合はimg要素として生成（Blob URLで即時プレビュー）
+            const img = document.createElement("img");
+            img.src = blobUrl;
+            img.dataset.tempId = tempId;
+            img.className = "inline-block max-h-48 my-2 mr-2 rounded-lg border border-gray-200 dark:border-gray-700 align-top";
+            nodeToInsert = img;
+        } else {
+            // その他のファイルはダウンロード用リンクとして生成
+            const link = document.createElement("a");
+            link.href = blobUrl;
+            link.download = file.name;
+            link.dataset.tempId = tempId;
+            link.contentEditable = "false";
+            link.target = "_blank";
+            link.rel = "noopener noreferrer";
+            link.textContent = `📎 ${file.name}`;
+            link.className = "inline-flex items-center gap-1 px-2.5 py-1 my-1 mr-2 text-xs font-medium text-blue-700 dark:text-blue-300 bg-blue-50 dark:bg-blue-900/30 border border-blue-200 dark:border-blue-800 rounded-md hover:bg-blue-100 cursor-pointer";
+            nodeToInsert = link;
+        }
+
+        // カーソル選択位置がある場合はそこに挿入、なければ末尾に追加
+        const selection = window.getSelection();
+        if(selection && selection.rangeCount > 0){
+            const range = selection.getRangeAt(0);
+            if(editor.contains(range.commonAncestorContainer)){
+                range.deleteContents();
+                range.insertNode(nodeToInsert);
+                range.collapse(false);
+                selection.removeAllRanges();
+                selection.addRange(range);
+            }else{
+                editor.appendChild(nodeToInsert);
             }
-            // カーソル選択位置がある場合はそこに挿入、なければ末尾に追加
-            const selection = window.getSelection();
-            if(selection && selection.rangeCount > 0){
-                const range = selection.getRangeAt(0);
-                if(editor.contains(range.commonAncestorContainer)){
-                    range.deleteContents();
-                    range.insertNode(nodeToInsert);
-
-                    range.collapse(false);
-                    selection.removeAllRanges();
-                    selection.addRange(range);
-                    return;
-                }
-            }
+        }else{
             editor.appendChild(nodeToInsert);
-        };
-        reader.readAsDataURL(file);
+        }
     };
 
     // ファイル選択時のハンドラー（複数ファイルの添付に対応）
@@ -207,6 +292,7 @@ export default function TopPage(){
         for(const file of Array.from(files)){
             insertFileToEditer(file, targetRef, false);
         }
+        e.target.value = "";
     }
 
     // クリップボードからの画像貼り付け（ペースト）ハンドラー
@@ -219,15 +305,26 @@ export default function TopPage(){
                 const file = item.getAsFile();
                 if(!file) continue;
                 event.preventDefault();
-                insertFileToEditer(file, targetRef, true)
+                insertFileToEditer(file, targetRef, true);
                 break;
             }
         }
     };
 
-    // 初回レンダリング時にメモ一覧を取得
+    // 編集モード切り替え時に編集対象のメモ本文をエディタへ設定
     useEffect(() => {
-        fetchMemos()
+        if(editingId && editorHistoryRef.current){
+            editorHistoryRef.current.innerHTML = editingMemoData.content;
+        }
+    }, [editingId])
+
+    // 初回レンダリング時にメモ一覧を取得（アンマウント時にBlob URLを解放）
+    useEffect(() => {
+        fetchMemos();
+        return () => {
+            pendingFilesRef.current.forEach(({ blobUrl }) => URL.revokeObjectURL(blobUrl));
+            pendingFilesRef.current.clear();
+        }
     }, [])
 
     return (
@@ -280,9 +377,10 @@ export default function TopPage(){
                 {/* 新規メモ保存ボタン */}
                 <button
                 onClick={(handleSave)}
-                className="px-4 py-2 bg-blue-600 hover:bg-blue-700 text-white font-medium rounded-lg shadow-sm transition-colors focus:outline-none focus:ring-2 focus:ring-blue-500 focus:ring-offset-2"
+                disabled={isSaving}
+                className="px-4 py-2 bg-blue-600 hover:bg-blue-700 text-white font-medium rounded-lg shadow-sm transition-colors focus:outline-none focus:ring-2 focus:ring-blue-500 focus:ring-offset-2 disabled:opacity-50"
                 >
-                保存
+                {isSaving ? "保存中..." : "保存"}
                 </button>
             </div>
             
@@ -316,11 +414,9 @@ export default function TopPage(){
                                     {/* 編集用リッチテキストエディタ */}
                                     <div
                                         ref={editorHistoryRef}
-                                        defaultValue={editingMemoData.content}
                                         contentEditable
                                         onPaste={(e) => handlePaste(e, editorHistoryRef)}
                                         className="w-full px-4 py-3 mb-4 text-sm text-gray-800 dark:text-gray-200 bg-transparent border border-gray-200 dark:border-gray-800 rounded-lg focus:ring-2 focus:ring-blue-500 focus:outline-none resize-y transition-all placeholder:text-gray-400 leading-relaxed"
-                                        dangerouslySetInnerHTML={{ __html: editingMemoData.content }}
                                         >
                                     </div>
                                     {/* ファイル添付・キャンセルボタンエリア */}
@@ -349,9 +445,10 @@ export default function TopPage(){
                                     {/* 編集内容保存ボタン */}
                                     <button
                                         onClick={() => {handleUpdate(memo.id)}}
-                                        className="px-1 py-0.5 bg-green-600 hover:bg-green-700 text-white font-medium rounded-lg shadow-sm transition-colors focus:outline-none focus:ring-2 focus:ring-green-500 focus:ring-offset-2 absolute top-3 right-4 text-xs"
+                                        disabled={isSaving}
+                                        className="px-1 py-0.5 bg-green-600 hover:bg-green-700 text-white font-medium rounded-lg shadow-sm transition-colors focus:outline-none focus:ring-2 focus:ring-green-500 focus:ring-offset-2 absolute top-3 right-4 text-xs disabled:opacity-50"
                                     >
-                                        保存
+                                        {isSaving ? "保存中..." : "保存"}
                                     </button>
                                 </>                            
                             ) : (
